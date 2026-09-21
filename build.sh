@@ -40,4 +40,4 @@ meson setup "$BUILD_DIR" \
 
 meson compile -C "$BUILD_DIR"
 
-echo "Build complete: $BUILD_DIR/madel-demo"
+echo "Build complete: $BUILD_DIR/raxter-demo"

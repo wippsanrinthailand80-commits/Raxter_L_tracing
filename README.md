@@ -54,7 +54,7 @@ test/
 ./build.sh --type release --max-bounces 8
 
 # Run demo
-./build_linux/madel-demo
+./build_linux/raxter-demo
 
 # Run tests
 meson test -C build_linux
@@ -70,7 +70,7 @@ export ANDROID_NDK_HOME=/path/to/android-ndk
 cd android
 ./build.sh --api 24 --abi arm64-v8a
 
-# Output: build_android_arm64-v8a_Release/libmadel.so
+# Output: build_android_arm64-v8a_Release/libraxter.so
 ```
 
 ## Rendering Modes
@@ -116,7 +116,7 @@ meson test -C build_linux --verbose
 ./build_linux/bench_wave_optics
 
 # Enable validation layers (default)
-./build_linux/madel-demo
+./build_linux/raxter-demo
 ```
 
 ## Shader Compilation

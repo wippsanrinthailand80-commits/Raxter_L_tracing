@@ -54,4 +54,4 @@ cmake .. \
 
 ninja
 
-echo "Build complete: $BUILD_DIR/libmadel.so"
+echo "Build complete: $BUILD_DIR/libraxter.so"

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(madel_android LANGUAGES C)
+project(raxter_android LANGUAGES C)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -10,7 +10,7 @@ set(ANDROID_STL c++_shared)
 
 find_package(Vulkan REQUIRED)
 
-add_library(madel SHARED
+add_library(raxter SHARED
     ../src/core/vk_core.c
     ../src/core/vk_debug.c
     ../src/core/vk_memory.c
@@ -35,7 +35,7 @@ add_library(madel SHARED
     ../src/platform/platform.c
 )
 
-target_include_directories(madel PRIVATE
+target_include_directories(raxter PRIVATE
     ../src
     ../src/core
     ../src/math
@@ -44,12 +44,12 @@ target_include_directories(madel PRIVATE
     ../src/platform
 )
 
-target_link_libraries(madel PRIVATE
+target_link_libraries(raxter PRIVATE
     ${VULKAN_LIBRARIES}
     android
     log
 )
 
-set_target_properties(madel PROPERTIES
+set_target_properties(raxter PROPERTIES
     ANDROID_LIBRARY_TYPE SHARED
 )
