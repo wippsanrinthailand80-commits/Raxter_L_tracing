@@ -1,0 +1,157 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+#define MAX_APERTURES 32
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct Aperture {
+    vec3 center;
+    vec3 normal;
+    vec3 up;
+    float radius;
+    int shape;
+};
+
+struct DiffractionParams {
+    ivec2 resolution;
+    uint num_apertures;
+    float screen_distance;
+    float wavelength_nm;
+    float time;
+    int pattern_type;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    DiffractionParams params;
+};
+
+layout(set = 0, binding = 1, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+float airy_pattern(float r, float radius, float wavelength, float distance) {
+    float k = 2.0 * 3.14159265359 / (wavelength * 1e-9);
+    float q = k * radius * r / distance;
+    if (q < 1e-6) return 1.0;
+    float j1 = sin(q) / (q * q) - cos(q) / q;
+    float airy = 2.0 * j1 / q;
+    return airy * airy;
+}
+
+float fresnel_number(float radius, float wavelength, float distance) {
+    return (radius * radius) / (wavelength * 1e-9 * distance);
+}
+
+vec2 fresnel_integrals(float x) {
+    float s = 0.0, c = 0.0;
+    float term_s = x, term_c = x;
+    float x2 = x * x;
+    float fact = 1.0;
+    
+    for (int n = 0; n < 20; n++) {
+        if (n > 0) {
+            fact *= (2 * n) * (2 * n + 1);
+            term_s *= -x2 * x2 / ((4 * n + 1) * (4 * n + 3) / ((2 * n + 1) * (2 * n + 2)));
+            term_c *= -x2 * x2 / ((4 * n + 3) * (4 * n + 5) / ((2 * n + 2) * (2 * n + 3)));
+        }
+        s += term_s;
+        c += term_c;
+        if (abs(term_s) < 1e-10 && abs(term_c) < 1e-10) break;
+    }
+    return vec2(s, c);
+}
+
+float fresnel_diffraction_rect(vec2 pos, vec2 aperture_size, float wavelength, float z) {
+    float k = 2.0 * 3.14159265359 / (wavelength * 1e-9);
+    float scale = sqrt(k / (2.0 * 3.14159265359 * z));
+    
+    vec2 u1 = (pos + aperture_size * 0.5) * scale;
+    vec2 u2 = (pos - aperture_size * 0.5) * scale;
+    
+    vec2 c1 = fresnel_integrals(u1.x);
+    vec2 s1 = fresnel_integrals(u1.y);
+    vec2 c2 = fresnel_integrals(u2.x);
+    vec2 s2 = fresnel_integrals(u2.y);
+    
+    float Cx = c1.x - c2.x;
+    float Sx = s1.x - s2.x;
+    float Cy = c1.y - c2.y;
+    float Sy = s1.y - s2.y;
+    
+    return (Cx * Cx + Sx * Sx) * (Cy * Cy + Sy * Sy) * 0.25;
+}
+
+float fraunhofer_diffraction_circle(vec2 pos, float radius, float wavelength, float z) {
+    float r = length(pos);
+    float k = 2.0 * 3.14159265359 / (wavelength * 1e-9);
+    float q = k * radius * r / z;
+    if (q < 1e-6) return 1.0;
+    float j1 = sin(q) / (q * q) - cos(q) / q;
+    float airy = 2.0 * j1 / q;
+    return airy * airy;
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    vec2 screen_pos = (vec2(pixel) - vec2(params.resolution) * 0.5) * 10e-6;
+    float wavelength = params.wavelength_nm;
+    float intensity = 0.0;
+    
+    if (params.pattern_type == 0) {
+        intensity = airy_pattern(length(screen_pos), 100e-6, wavelength, params.screen_distance);
+    } else if (params.pattern_type == 1) {
+        intensity = fresnel_diffraction_rect(screen_pos, vec2(200e-6), wavelength, params.screen_distance);
+    } else if (params.pattern_type == 2) {
+        intensity = fraunhofer_diffraction_circle(screen_pos, 100e-6, wavelength, params.screen_distance);
+    } else if (params.pattern_type == 3) {
+        float k = 2.0 * 3.14159265359 / (wavelength * 1e-9);
+        float r = length(screen_pos);
+        float phase = k * r * r / (2.0 * params.screen_distance);
+        intensity = cos(phase) * cos(phase);
+    }
+    
+    vec3 color = wavelength_to_rgb(wavelength) * intensity;
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    output_image[idx] = vec4(color, 1.0);
+}

@@ -1,0 +1,266 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+#define MAX_WAVELENGTHS 32
+#define MAX_SOURCES 64
+#define MAX_BOUNCES 8
+#define MAX_OBJECTS 256
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct LightSource {
+    vec3 position;
+    vec3 direction;
+    WaveSpectrum spectrum;
+    float intensity;
+    float coherence_length;
+    bool is_coherent;
+};
+
+struct MaterialOptical {
+    float refractive_index_real;
+    float refractive_index_imag;
+    float absorption_coefficient;
+    float scattering_coefficient;
+    vec3 anisotropy;
+};
+
+struct SceneObject {
+    vec3 center;
+    float radius;
+    uint material_id;
+    int type;
+};
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+    WaveSpectrum spectrum;
+    float intensity;
+    uint bounce_count;
+    float path_length;
+};
+
+struct LightPropagationParams {
+    ivec3 volume_resolution;
+    uint num_sources;
+    uint num_objects;
+    uint max_bounces;
+    float time;
+    float voxel_size;
+    vec3 volume_origin;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    LightPropagationParams params;
+};
+
+layout(set = 0, binding = 1, std140) readonly buffer SourceBuffer {
+    LightSource sources[MAX_SOURCES];
+};
+
+layout(set = 0, binding = 2, std140) readonly buffer ObjectBuffer {
+    SceneObject objects[MAX_OBJECTS];
+};
+
+layout(set = 0, binding = 3, std140) readonly buffer MaterialBuffer {
+    MaterialOptical materials[256];
+};
+
+layout(set = 0, binding = 4, std140) writeonly buffer VolumeBuffer {
+    vec4 volume_data[];
+};
+
+bool intersect_sphere(vec3 ro, vec3 rd, vec3 center, float radius, out float t) {
+    vec3 oc = ro - center;
+    float b = dot(oc, rd);
+    float c = dot(oc, oc) - radius * radius;
+    float disc = b * b - c;
+    if (disc < 0.0) return false;
+    t = -b - sqrt(disc);
+    return t > 1e-4;
+}
+
+vec3 my_reflect(vec3 v, vec3 n) {
+    return v - 2.0 * dot(v, n) * n;
+}
+
+bool refract(vec3 v, vec3 n, float eta, out vec3 refracted) {
+    float cosi = clamp(dot(v, n), -1.0, 1.0);
+    float etai = 1.0, etat = eta;
+    vec3 n_out = n;
+    
+    if (cosi < 0.0) {
+        cosi = -cosi;
+    } else {
+        float tmp = etai;
+        etai = etat;
+        etat = tmp;
+        n_out = -n;
+    }
+    
+    float eta_ratio = etai / etat;
+    float k = 1.0 - eta_ratio * eta_ratio * (1.0 - cosi * cosi);
+    if (k < 0.0) return false;
+    refracted = eta_ratio * v + (eta_ratio * cosi - sqrt(k)) * n_out;
+    return true;
+}
+
+float fresnel_dielectric(float cos_theta_i, float eta_i, float eta_t) {
+    float sin_theta_t_sq = (eta_i / eta_t) * (eta_i / eta_t) * (1.0 - cos_theta_i * cos_theta_i);
+    if (sin_theta_t_sq >= 1.0) return 1.0;
+    
+    float cos_theta_t = sqrt(1.0 - sin_theta_t_sq);
+    float rs = (eta_i * cos_theta_i - eta_t * cos_theta_t) / (eta_i * cos_theta_i + eta_t * cos_theta_t);
+    float rp = (eta_t * cos_theta_i - eta_i * cos_theta_t) / (eta_t * cos_theta_i + eta_i * cos_theta_t);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+WaveSpectrum trace_ray(Ray ray, uint max_bounces) {
+    WaveSpectrum accumulated;
+    accumulated.count = 0;
+    for (int i = 0; i < MAX_WAVELENGTHS; i++) {
+        accumulated.components[i] = WaveComponent(0.0, 0.0, 0.0, vec3(0.0));
+    }
+    
+    for (uint bounce = 0; bounce < max_bounces; bounce++) {
+        float closest_t = 1e30;
+        int hit_object = -1;
+        
+        for (uint i = 0; i < params.num_objects; i++) {
+            float t;
+            if (intersect_sphere(ray.origin, ray.direction, objects[i].center, objects[i].radius, t)) {
+                if (t < closest_t) {
+                    closest_t = t;
+                    hit_object = int(i);
+                }
+            }
+        }
+        
+        if (hit_object == -1) break;
+        
+        SceneObject obj = objects[hit_object];
+        MaterialOptical mat = materials[obj.material_id];
+        
+        vec3 hit_pos = ray.origin + ray.direction * closest_t;
+        vec3 normal = normalize(hit_pos - obj.center);
+        
+        ray.path_length += closest_t;
+        
+        for (uint w = 0; w < ray.spectrum.count; w++) {
+            WaveComponent comp = ray.spectrum.components[w];
+            float lambda = comp.wavelength_nm;
+            
+            float fresnel = fresnel_dielectric(abs(dot(ray.direction, normal)), 1.0, mat.refractive_index_real);
+            float phase_shift = 0.0;
+            
+            float cos_theta_i = abs(dot(ray.direction, normal));
+            float sin_theta_t_sq = (1.0 / mat.refractive_index_real) * (1.0 / mat.refractive_index_real) * (1.0 - cos_theta_i * cos_theta_i);
+            if (sin_theta_t_sq >= 1.0) {
+                phase_shift = 3.14159265359;
+            } else {
+                float cos_theta_t = sqrt(1.0 - sin_theta_t_sq);
+                float rp = (mat.refractive_index_real * cos_theta_i - cos_theta_t) / 
+                           (mat.refractive_index_real * cos_theta_i + cos_theta_t);
+                phase_shift = (rp < 0.0) ? 3.14159265359 : 0.0;
+            }
+            
+            float attenuation = exp(-mat.absorption_coefficient * ray.path_length);
+            float scattering = exp(-mat.scattering_coefficient * ray.path_length);
+            
+            WaveComponent refl_comp = comp;
+            refl_comp.amplitude *= sqrt(fresnel) * attenuation * scattering;
+            refl_comp.phase += phase_shift;
+            
+            if (accumulated.count < MAX_WAVELENGTHS) {
+                accumulated.components[accumulated.count++] = refl_comp;
+            }
+            
+            vec3 reflected_dir = my_reflect(ray.direction, normal);
+            ray.direction = reflected_dir;
+            ray.origin = hit_pos + normal * 1e-4;
+            
+            if ((1.0 - fresnel) < 0.001) break;
+        }
+    }
+    
+    return accumulated;
+}
+
+void main() {
+    ivec3 voxel = ivec3(gl_GlobalInvocationID.xyz);
+    if (voxel.x >= params.volume_resolution.x || 
+        voxel.y >= params.volume_resolution.y || 
+        voxel.z >= params.volume_resolution.z) return;
+    
+    vec3 world_pos = params.volume_origin + vec3(voxel) * params.voxel_size;
+    uint vol_idx = (voxel.z * params.volume_resolution.y + voxel.y) * params.volume_resolution.x + voxel.x;
+    
+    vec3 accumulated_color = vec3(0.0);
+    float total_intensity = 0.0;
+    
+    for (uint s = 0; s < params.num_sources; s++) {
+        LightSource src = sources[s];
+        
+        Ray ray;
+        ray.origin = src.position;
+        ray.direction = normalize(world_pos - src.position);
+        ray.spectrum = src.spectrum;
+        ray.intensity = src.intensity;
+        ray.bounce_count = 0;
+        ray.path_length = 0.0;
+        
+        WaveSpectrum result = trace_ray(ray, params.max_bounces);
+        
+        for (uint w = 0; w < result.count; w++) {
+            WaveComponent comp = result.components[w];
+            float intensity = comp.amplitude * comp.amplitude;
+            vec3 color = wavelength_to_rgb(comp.wavelength_nm);
+            accumulated_color += color * intensity;
+            total_intensity += intensity;
+        }
+    }
+    
+    if (total_intensity > 0.0) {
+        accumulated_color /= total_intensity;
+    }
+    
+    accumulated_color = pow(clamp(accumulated_color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    volume_data[vol_idx] = vec4(accumulated_color, total_intensity);
+}

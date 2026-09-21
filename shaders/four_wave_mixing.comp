@@ -1,0 +1,253 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+#define MAX_SOURCES 64
+#define PI 3.14159265359
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct LightSource {
+    vec3 position;
+    vec3 direction;
+    WaveSpectrum spectrum;
+    float intensity;
+    float coherence_length;
+    float pump_power;
+    float chi3;
+    float phase_mismatch;
+};
+
+struct FourWaveMixingParams {
+    ivec2 resolution;
+    uint num_pumps;
+    float time;
+    float interaction_length;
+    float nonlinear_coeff;
+    float dispersion;
+    int process_type;
+    float phase_matching;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    FourWaveMixingParams params;
+};
+
+layout(set = 0, binding = 1, std140) readonly buffer SourceBuffer {
+    LightSource pumps[MAX_SOURCES];
+};
+
+layout(set = 0, binding = 2, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+float phase_matching_efficiency(float delta_k, float L) {
+    if (abs(delta_k) < 1e-6) return 1.0;
+    float sinc = sin(delta_k * L / 2.0) / (delta_k * L / 2.0);
+    return sinc * sinc;
+}
+
+float degen_fwm_gain(float gamma, float P, float delta_k, float L) {
+    float g = sqrt(gamma * gamma * P * P - delta_k * delta_k / 4.0);
+    if (g > 0.0) {
+        float cosh_gL = cosh(g * L);
+        float sinh_gL = sinh(g * L);
+        return (cosh_gL + delta_k * delta_k / (4.0 * g * g) * sinh_gL * sinh_gL);
+    } else {
+        float g_imag = sqrt(-gamma * gamma * P * P + delta_k * delta_k / 4.0);
+        float cos_gL = cos(g_imag * L);
+        float sin_gL = sin(g_imag * L);
+        return (cos_gL + delta_k * delta_k / (4.0 * g_imag * g_imag) * sin_gL * sin_gL);
+    }
+}
+
+vec3 four_wave_mixing(vec3 E1, vec3 E2, vec3 E3, float chi3, float L, float delta_k) {
+    float gamma = 3.0 * chi3 / (4.0 * 3e8 * 1e-6);
+    
+    if (params.process_type == 0) {
+        float P = dot(E1, E1) + dot(E2, E2) + dot(E3, E3);
+        float G = degen_fwm_gain(gamma, P, delta_k, L);
+        return E3 * sqrt(G);
+    }
+    else if (params.process_type == 1) {
+        float G = degen_fwm_gain(gamma, dot(E1, E1), delta_k, L);
+        return E2 * sqrt(G);
+    }
+    else if (params.process_type == 2) {
+        float G1 = degen_fwm_gain(gamma, dot(E1, E1), delta_k, L);
+        float G2 = degen_fwm_gain(gamma, dot(E2, E2), delta_k, L);
+        return E3 * sqrt(G1 * G2);
+    }
+    else if (params.process_type == 2) {
+        return E1 + E2 - E3;
+    }
+    else if (params.process_type == 3) {
+        float gamma_eff = gamma * params.phase_matching;
+        float P = dot(E1, E1) + dot(E2, E2) + dot(E3, E3);
+        float G = degen_fwm_gain(gamma_eff, P, delta_k, L);
+        return E3 * sqrt(G);
+    }
+    
+    return E3;
+}
+
+float cw_spectrum(float lambda_nm, float lambda0_nm, float bandwidth) {
+    float lambda = lambda_nm * 1e-9;
+    float lambda0 = lambda0_nm * 1e-9;
+    float sigma = bandwidth * 1e-9;
+    
+    float diff = (lambda - lambda0) / sigma;
+    return exp(-0.5 * diff * diff);
+}
+
+float sech_pulse(float t, float tau) {
+    return 1.0 / cosh(t / tau);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(params.resolution);
+    uv = uv * 2.0 - 1.0;
+    
+    float lambda_p = 1550.0;
+    float lambda_s = 1530.0;
+    float lambda_i = 1570.0;
+    
+    float delta_k = 0.0;
+    float lambda_p_nm = 1550.0;
+    float lambda_s_nm = 1530.0;
+    float lambda_i_nm = 1570.0;
+    
+    if (params.process_type == 0) {
+        delta_k = params.phase_matching;
+    }
+    else if (params.process_type == 1) {
+        delta_k = params.phase_matching;
+    }
+    else if (params.process_type == 2) {
+        delta_k = params.phase_matching;
+    }
+    else if (params.process_type == 3) {
+        delta_k = params.phase_matching;
+    }
+    else if (params.process_type == 4) {
+        delta_k = params.phase_matching;
+    }
+    else if (params.process_type == 5) {
+        delta_k = params.phase_matching;
+    }
+    else {
+        delta_k = params.phase_matching;
+    }
+    
+    float efficiency = phase_matching_efficiency(delta_k, params.interaction_length);
+    
+    float intensity = 0.0;
+    vec3 color = vec3(0.0);
+    
+    if (params.process_type == 0) {
+        intensity = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length);
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 1) {
+        intensity = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length);
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 2) {
+        intensity = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length);
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 3) {
+        intensity = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length);
+        color = vec3(intensity, intensity * 0.5, intensity * 0.25);
+    }
+    else if (params.process_type == 4) {
+        float I0 = 1.0;
+        float I_gain = degen_fwm_gain(1.0, I0, delta_k, params.interaction_length);
+        intensity = I_gain * I0;
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 5) {
+        intensity = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length);
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 6) {
+        float delta_lambda = abs(lambda_p - lambda_s);
+        float tuning = uv.x * 50.0 - 25.0;
+        float detuning = delta_lambda - tuning;
+        float phase_match = exp(-detuning * detuning / 100.0);
+        intensity = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length) * phase_match;
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 7) {
+        float tau = pumps[0].pump_power;
+        float I = degen_fwm_gain(1.0, 1.0, delta_k, params.interaction_length);
+        float phase = params.time * 1e15;
+        intensity = I * (1.0 + 0.5 * sin(phase));
+        color = vec3(intensity);
+    }
+    else if (params.process_type == 8) {
+        float I0 = 1.0;
+        float L = params.interaction_length;
+        float z = uv.x * L;
+        float I = I0 * exp(z / L);
+        intensity = I;
+        color = vec3(intensity, intensity * 0.5, intensity * 0.2);
+    }
+    else if (params.process_type == 9) {
+        float lambda_c = uv.x * 100.0 + 1500.0;
+        float lambda_p = 1550.0;
+        float lambda_s = lambda_p + lambda_c;
+        float lambda_i = lambda_p - lambda_c;
+        
+        float detuning = abs(lambda_s - lambda_i);
+        float phase_match = exp(-detuning * detuning / 100.0);
+        
+        intensity = degen_fwm_gain(1.0, 1.0, params.phase_matching, params.interaction_length) * phase_match;
+        color = vec3(intensity);
+    }
+    
+    float lambda = uv.x * 200.0 + 1400.0;
+    color = wavelength_to_rgb(lambda) * color * efficiency;
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    output_image[idx] = vec4(color, 1.0);
+}

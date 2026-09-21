@@ -1,0 +1,124 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_SPECTRAL_SAMPLES 32
+#define CIE_SAMPLES 81
+
+struct SpectralPower {
+    float samples[MAX_SPECTRAL_SAMPLES];
+    float lambda_min;
+    float lambda_max;
+};
+
+struct SpectralRenderParams {
+    ivec2 resolution;
+    uint num_samples;
+    float lambda_min;
+    float lambda_max;
+    float exposure;
+    float gamma;
+    int tonemap_mode;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    SpectralRenderParams params;
+};
+
+layout(set = 0, binding = 1, std140) readonly buffer SpectralBuffer {
+    SpectralPower spectral_image[];
+};
+
+layout(set = 0, binding = 2, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+const float CIE_LAMBDA_MIN = 360.0;
+const float CIE_LAMBDA_MAX = 830.0;
+
+float cie_x_func(float lambda) {
+    int idx = int((lambda - CIE_LAMBDA_MIN) / (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN) * (CIE_SAMPLES - 1.0));
+    idx = clamp(idx, 0, CIE_SAMPLES - 1);
+    return 0.0;
+}
+
+float cie_y_func(float lambda) {
+    int idx = int((lambda - CIE_LAMBDA_MIN) / (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN) * (CIE_SAMPLES - 1.0));
+    idx = clamp(idx, 0, CIE_SAMPLES - 1);
+    return 0.0;
+}
+
+float cie_z_func(float lambda) {
+    int idx = int((lambda - CIE_LAMBDA_MIN) / (CIE_LAMBDA_MAX - CIE_LAMBDA_MIN) * (CIE_SAMPLES - 1.0));
+    idx = clamp(idx, 0, CIE_SAMPLES - 1);
+    return 0.0;
+}
+
+vec3 spectrum_to_xyz(SpectralPower s) {
+    vec3 xyz = vec3(0.0);
+    float delta_lambda = (s.lambda_max - s.lambda_min) / (MAX_SPECTRAL_SAMPLES - 1.0);
+    
+    for (uint i = 0; i < params.num_samples; i++) {
+        float lambda = s.lambda_min + float(i) * delta_lambda;
+        float x = cie_x_func(lambda);
+        float y = cie_y_func(lambda);
+        float z = cie_z_func(lambda);
+        
+        xyz.x += s.samples[i] * x * delta_lambda;
+        xyz.y += s.samples[i] * y * delta_lambda;
+        xyz.z += s.samples[i] * z * delta_lambda;
+    }
+    
+    return xyz;
+}
+
+float srgb_comp_func(float c) {
+    return (c <= 0.0031308) ? 12.92 * c : 1.055 * pow(c, 1.0/2.4) - 0.055;
+}
+
+vec3 xyz_to_srgb(vec3 xyz) {
+    float r =  3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z;
+    float g = -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z;
+    float b =  0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z;
+    
+    return clamp(vec3(srgb_comp_func(r), srgb_comp_func(g), srgb_comp_func(b)), 0.0, 1.0);
+}
+
+float reinhard_tonemap(float x) {
+    return x / (1.0 + x);
+}
+
+vec3 aces_filmic(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    SpectralPower s = spectral_image[idx];
+    
+    vec3 xyz = spectrum_to_xyz(s);
+    vec3 rgb = xyz_to_srgb(xyz);
+    
+    rgb *= params.exposure;
+    
+    if (params.tonemap_mode == 0) {
+        rgb = vec3(reinhard_tonemap(rgb.x), reinhard_tonemap(rgb.y), reinhard_tonemap(rgb.z));
+    } else if (params.tonemap_mode == 1) {
+        rgb = aces_filmic(rgb);
+    } else {
+        rgb = clamp(rgb, 0.0, 1.0);
+    }
+    
+    rgb = pow(rgb, vec3(1.0 / params.gamma));
+    
+    output_image[idx] = vec4(rgb, 1.0);
+}

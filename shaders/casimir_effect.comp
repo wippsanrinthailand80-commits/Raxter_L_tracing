@@ -1,0 +1,269 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+#define PI 3.14159265359
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct CasimirParams {
+    ivec2 resolution;
+    float time;
+    float plate_separation;
+    float plate_area;
+    float temperature;
+    int geometry_type;
+    float curvature;
+    int material_model;
+};
+
+float three_body_casimir(float d1, float d2, float alpha1, float alpha2, float alpha3);
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    CasimirParams params;
+};
+
+layout(set = 0, binding = 1, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+const float HBAR = 1.054571817e-34;
+const float C = 299792458.0;
+const float K_B = 1.380649e-23;
+const float ALPHA_FINE = 1.0 / 137.035999084;
+
+float zeta(float s) {
+    if (s == 3.0) return 1.2020569031595942854;
+    if (s == 4.0) return 1.0823232337111381915;
+    if (s == 2.0) return 1.6449340668482264365;
+    return 1.0;
+}
+
+float perfect_conductor_force(float d) {
+    if (d <= 0.0) return 0.0;
+    return -PI * PI * HBAR * C / (240.0 * d * d * d * d);
+}
+
+float perfect_conductor_energy(float d, float A) {
+    if (d <= 0.0) return 0.0;
+    return -PI * PI * HBAR * C * A / (720.0 * d * d * d);
+}
+
+float finite_conductivity_correction(float d, float lambda_p) {
+    if (d <= 0.0) return 1.0;
+    float ratio = d / lambda_p;
+    return 1.0 - 8.0/3.0 * ratio + 16.0/15.0 * ratio * ratio * log(ratio);
+}
+
+float drude_model_force(float d, float omega_p, float gamma) {
+    if (d <= 0.0) return 0.0;
+    float omega_p_d = omega_p * d / C;
+    float gamma_d = gamma * d / C;
+    
+    float correction = 1.0 - 8.0/3.0 * omega_p_d;
+    if (gamma > 0.0) {
+        correction += 16.0/15.0 * gamma_d * log(gamma_d);
+    }
+    
+    return perfect_conductor_force(d) * correction;
+}
+
+float plasma_model_force(float d, float omega_p) {
+    if (d <= 0.0) return 0.0;
+    float omega_p_d = omega_p * d / C;
+    float correction = 1.0 - 8.0/3.0 * omega_p_d;
+    return perfect_conductor_force(d) * correction;
+}
+
+float rough_surface_force(float d, float sigma, float xi) {
+    if (d <= 0.0) return 0.0;
+    float correction = 1.0 + 6.0 * sigma * sigma / (d * d) - 12.0 * sigma * sigma * sigma * sigma / (d * d * d * d);
+    return perfect_conductor_force(d) * correction;
+}
+
+float temperature_correction(float d, float T) {
+    if (T <= 0.0) return 1.0;
+    float lambda_T = HBAR * C / (K_B * T);
+    float ratio = d / lambda_T;
+    
+    if (ratio < 1.0) {
+        return 1.0 + PI*PI*PI / 45.0 * ratio * ratio * ratio;
+    } else {
+        return lambda_T / (2.0 * d);
+    }
+}
+
+float sphere_plate_force(float R, float d) {
+    if (d <= 0.0 || R <= 0.0) return 0.0;
+    return -PI * PI * HBAR * C * R / (360.0 * d * d * d);
+}
+
+float cylinder_plate_force(float R, float L, float d) {
+    if (d <= 0.0 || R <= 0.0) return 0.0;
+    return -PI * PI * HBAR * C * L * sqrt(R) / (720.0 * sqrt(2.0) * d * d * d * d);
+}
+
+float crossed_cylinders_force(float R1, float R2, float L, float d) {
+    if (d <= 0.0) return 0.0;
+    float R_eff = R1 * R2 / (R1 + R2);
+    return -PI * PI * HBAR * C * L * sqrt(R_eff) / (720.0 * sqrt(2.0) * d * d * d * d);
+}
+
+float repulsive_casimir(float d, float eps1, float eps2, float eps3) {
+    if (d <= 0.0) return 0.0;
+    if ((eps1 - eps3) * (eps2 - eps3) < 0.0) {
+        return -perfect_conductor_force(d) * 0.1;
+    }
+    return perfect_conductor_force(d);
+}
+
+float dynamic_casimir(float d, float omega, float amplitude) {
+    if (d <= 0.0) return 0.0;
+    float photon_rate = (amplitude * omega / C) * (amplitude * omega / C) * (omega * omega) * d * d;
+    return photon_rate * HBAR * omega;
+}
+
+float quantum_vacuum_energy_density(float cutoff) {
+    if (cutoff <= 0.0) return 0.0;
+    return HBAR * C * cutoff * cutoff * cutoff * cutoff / (16.0 * PI * PI);
+}
+
+float casimir_polder_force(float d, float alpha1, float alpha2) {
+    if (d <= 0.0) return 0.0;
+    return -23.0 * HBAR * C * alpha1 * alpha2 / (4.0 * PI * d * d * d * d * d * d * d);
+}
+
+float vacuum_energy_spectrum(float k) {
+    return 0.5 * HBAR * C * k;
+}
+
+float lamb_shift(float n, float Z) {
+    return ALPHA_FINE * ALPHA_FINE * ALPHA_FINE * Z * Z * Z * Z * 13.6 / (n * n * n) * (log(1.0 / (ALPHA_FINE * ALPHA_FINE * Z * Z)) + 1.0);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(params.resolution);
+    
+    float d = params.plate_separation * 1e-9;
+    float A = params.plate_area * 1e-12;
+    float T = params.temperature;
+    
+    float force = 0.0;
+    float energy = 0.0;
+    vec3 color = vec3(0.0);
+    
+    if (params.geometry_type == 0) {
+        force = perfect_conductor_force(d);
+        if (params.material_model == 1) force *= finite_conductivity_correction(d, 136e-9);
+        else if (params.material_model == 2) force *= drude_model_force(d, 1.3e16, 5e13);
+        else if (params.material_model == 3) force *= plasma_model_force(d, 1.3e16);
+        if (T > 0.0) force *= temperature_correction(d, T);
+    }
+    else if (params.geometry_type == 1) {
+        float R = 100e-6;
+        force = sphere_plate_force(R, d);
+    }
+    else if (params.geometry_type == 2) {
+        float R = 100e-6;
+        float L = 10e-6;
+        force = cylinder_plate_force(R, L, d);
+    }
+    else if (params.geometry_type == 3) {
+        float R1 = 100e-6, R2 = 50e-6, L = 10e-6;
+        force = crossed_cylinders_force(R1, R2, L, d);
+    }
+    else if (params.geometry_type == 4) {
+        float eps1 = 2.0, eps2 = 4.0, eps3 = 3.0;
+        force = repulsive_casimir(d, eps1, eps2, eps3);
+    }
+    else if (params.geometry_type == 5) {
+        float omega = 2.0 * PI * 1e6;
+        float amp = 1e-9;
+        force = dynamic_casimir(d, omega, amp);
+    }
+    else if (params.geometry_type == 6) {
+        float cutoff = 1.0 / d;
+        float energy_density = quantum_vacuum_energy_density(cutoff);
+        color = vec3(energy_density / 1e30);
+        force = 0.0;
+    }
+    else if (params.geometry_type == 7) {
+        float alpha1 = 1e-40, alpha2 = 1e-40;
+        force = casimir_polder_force(d, alpha1, alpha2);
+    }
+    else if (params.geometry_type == 8) {
+        float alpha1 = 1e-40, alpha2 = 1e-40, alpha3 = 1e-40;
+        force = three_body_casimir(d, d*2.0, alpha1, alpha2, alpha3);
+    }
+    else if (params.geometry_type == 9) {
+        float lambda = uv.x * 1000.0 + 100.0;
+        float k = 2.0 * PI / (lambda * 1e-9);
+        float energy = vacuum_energy_spectrum(k);
+        color = vec3(energy / 1e-15);
+    }
+    
+    if (force != 0.0) {
+        float force_nN = abs(force) * 1e9;
+        color = vec3(min(force_nN / 1000.0, 1.0), 
+                     min(force_nN / 100.0, 1.0), 
+                     min(force_nN / 10.0, 1.0));
+        
+        if (force > 0.0) color = vec3(color.b, color.g, color.r);
+    }
+    
+    if (params.geometry_type == 0) {
+        energy = perfect_conductor_energy(d, A);
+        color = vec3(energy / 1e-18);
+    }
+    
+    float lambda = uv.x * 1000.0 + 100.0;
+    color = wavelength_to_rgb(lambda) * color;
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    output_image[idx] = vec4(color, 1.0);
+}
+
+float three_body_casimir(float d1, float d2, float alpha1, float alpha2, float alpha3) {
+    if (d1 <= 0.0 || d2 <= 0.0) return 0.0;
+    return -HBAR * C * alpha1 * alpha2 * alpha3 / (d1 * d1 * d1 * d1 * d2 * d2 * d2 * d2);
+}

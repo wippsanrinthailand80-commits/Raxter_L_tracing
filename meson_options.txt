@@ -1,0 +1,4 @@
+option('android-ndk', type: 'string', value: '', description: 'Path to Android NDK')
+option('android-api', type: 'string', value: '24', description: 'Android API level')
+option('enable-validation', type: 'boolean', value: true, description: 'Enable Vulkan validation layers')
+option('max-light-bounces', type: 'integer', value: 8, description: 'Maximum light bounces (1-8)')

@@ -1,0 +1,269 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+#define MAX_SOURCES 64
+#define PI 3.14159265359
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct LightSource {
+    vec3 position;
+    vec3 direction;
+    WaveSpectrum spectrum;
+    float intensity;
+    float coherence_length;
+    int topological_charge;
+    float beam_waist;
+    int mode_type;
+};
+
+struct OAMParams {
+    ivec2 resolution;
+    uint num_sources;
+    float time;
+    float propagation_distance;
+    float screen_distance;
+    int visualization_mode;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    OAMParams params;
+};
+
+layout(set = 0, binding = 1, std140) readonly buffer SourceBuffer {
+    LightSource sources[MAX_SOURCES];
+};
+
+layout(set = 0, binding = 2, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+float factorial(int n) {
+    if (n <= 1) return 1.0;
+    float result = 1.0;
+    for (int i = 2; i <= n; i++) result *= float(i);
+    return result;
+}
+
+float laguerre_poly(int p, int l, float x) {
+    if (p == 0) return 1.0;
+    if (p == 1) return 1.0 + float(l) - x;
+    
+    float L0 = 1.0;
+    float L1 = 1.0 + float(l) - x;
+    float Lp = 0.0;
+    
+    for (int i = 2; i <= p; i++) {
+        Lp = ((2.0 + float(i-1) + float(l) - x) * L1 - (float(i-1) + float(l)) * L0) / float(i);
+        L0 = L1;
+        L1 = Lp;
+    }
+    return Lp;
+}
+
+float hermite_poly(int n, float x) {
+    if (n == 0) return 1.0;
+    if (n == 1) return 2.0 * x;
+    
+    float H0 = 1.0;
+    float H1 = 2.0 * x;
+    float Hn = 0.0;
+    
+    for (int i = 2; i <= n; i++) {
+        Hn = 2.0 * x * H1 - 2.0 * float(i-1) * H0;
+        H0 = H1;
+        H1 = Hn;
+    }
+    return Hn;
+}
+
+vec2 hermite_gauss_mode(int n, int m, float x, float y, float w) {
+    float X = x * sqrt(2.0) / w;
+    float Y = y * sqrt(2.0) / w;
+    
+    float Hn = hermite_poly(n, X);
+    float Hm = hermite_poly(m, Y);
+    
+    float norm = 1.0 / sqrt(PI * factorial(n) * factorial(m) * pow(2.0, float(n+m)));
+    float amp = norm * Hn * Hm * exp(-(X*X + Y*Y));
+    
+    return vec2(amp, 0.0);
+}
+
+vec2 laguerre_gauss_mode(int p, int l, float r, float phi, float w) {
+    float R = r * sqrt(2.0) / w;
+    float X = R * R;
+    
+    float Lpl = laguerre_poly(p, abs(l), X);
+    
+    float norm = sqrt(2.0 * factorial(p) / (PI * factorial(p + abs(l))));
+    float amp = norm * pow(R, float(abs(l))) * Lpl * exp(-X);
+    
+    float phase = float(l) * phi;
+    return vec2(amp * cos(phase), amp * sin(phase));
+}
+
+vec2 bessel_gauss_mode(int m, float r, float phi, float w, float k_t) {
+    float R = r;
+    float Jm = 0.0;
+    
+    if (m == 0) Jm = sin(k_t * R) / (k_t * R);
+    else if (m == 1) Jm = (sin(k_t * R) / (k_t * R) - cos(k_t * R)) / (k_t * R);
+    else Jm = 0.0;
+    
+    float amp = Jm * exp(-R*R / (w*w));
+    float phase = float(m) * phi;
+    
+    return vec2(amp * cos(phase), amp * sin(phase));
+}
+
+vec2 airy_mode(float r, float phi, float a) {
+    float kr = a * r;
+    if (kr < 1e-6) return vec2(1.0, 0.0);
+    float J1 = sin(kr) / (kr*kr) - cos(kr) / kr;
+    float airy = 2.0 * J1 / kr;
+    return vec2(airy * cos(phi), airy * sin(phi));
+}
+
+vec2 perfect_vortex_mode(int l, float r, float phi, float w) {
+    float R = r;
+    float rho = R / w;
+    
+    float amp = exp(-rho*rho / 2.0) * pow(rho, float(abs(l))) / sqrt(factorial(abs(l)));
+    float phase = float(l) * phi;
+    
+    return vec2(amp * cos(phase), amp * sin(phase));
+}
+
+vec2 vector_vortex_mode(int l, float r, float phi, float w, float radial_pol) {
+    vec2 scalar_mode = laguerre_gauss_mode(0, l, r, phi, w);
+    
+    vec3 pol;
+    if (radial_pol > 0.5) {
+        pol = vec3(cos(phi), sin(phi), 0.0);
+    } else {
+        pol = vec3(-sin(phi), cos(phi), 0.0);
+    }
+    
+    float amp = length(scalar_mode);
+    float phase = atan(scalar_mode.y, scalar_mode.x);
+    return vec2(amp, phase);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    
+    vec2 screen_pos = (vec2(pixel) - vec2(params.resolution) * 0.5) * 10e-6;
+    float r = length(screen_pos);
+    float phi = atan(screen_pos.y, screen_pos.x);
+    float wavelength = 633.0;
+    
+    vec2 field = vec2(0.0);
+    float intensity = 0.0;
+    vec3 color = vec3(0.0);
+    
+    for (uint s = 0; s < params.num_sources; s++) {
+        LightSource src = sources[s];
+        
+        if (src.mode_type == 0) {
+            field = laguerre_gauss_mode(0, src.topological_charge, r, phi, src.beam_waist);
+        }
+        else if (src.mode_type == 1) {
+            field = hermite_gauss_mode(src.topological_charge, 0, screen_pos.x, screen_pos.y, src.beam_waist);
+        }
+        else if (src.mode_type == 2) {
+            field = bessel_gauss_mode(src.topological_charge, r, phi, src.beam_waist, 10000.0);
+        }
+        else if (src.mode_type == 3) {
+            field = airy_mode(r, phi, 1.0 / src.beam_waist);
+        }
+        else if (src.mode_type == 4) {
+            field = perfect_vortex_mode(src.topological_charge, r, phi, src.beam_waist);
+        }
+        else if (src.mode_type == 5) {
+            field = vector_vortex_mode(src.topological_charge, r, phi, src.beam_waist, 1.0);
+        }
+    }
+    
+    if (params.visualization_mode == 0) {
+        intensity = field.x * field.x + field.y * field.y;
+        color = vec3(intensity);
+    }
+    else if (params.visualization_mode == 1) {
+        float phase = atan(field.y, field.x);
+        intensity = field.x * field.x + field.y * field.y;
+        color = vec3(intensity * (1.0 + sin(phase + params.time)) * 0.5);
+    }
+    else if (params.visualization_mode == 2) {
+        float phase = atan(field.y, field.x);
+        color = vec3(
+            (1.0 + cos(phase)) * 0.5,
+            (1.0 + cos(phase - 2.094)) * 0.5,
+            (1.0 + cos(phase + 2.094)) * 0.5
+        );
+        color *= field.x * field.x + field.y * field.y;
+    }
+    else if (params.visualization_mode == 3) {
+        float phase = atan(field.y, field.x);
+        color = vec3(
+            (1.0 + cos(float(1) * phase)) * 0.5,
+            (1.0 + cos(float(2) * phase)) * 0.5,
+            (1.0 + cos(float(3) * phase)) * 0.5
+        );
+    }
+    else if (params.visualization_mode == 4) {
+        float phase = atan(field.y, field.x);
+        color = vec3(intensity * phase / PI, intensity * 0.5, intensity);
+    }
+    
+    for (uint s = 0; s < params.num_sources; s++) {
+        LightSource src = sources[s];
+        for (uint w = 0; w < src.spectrum.count; w++) {
+            WaveComponent comp = src.spectrum.components[w];
+            color = wavelength_to_rgb(comp.wavelength_nm) * color;
+        }
+    }
+    
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    output_image[idx] = vec4(color, 1.0);
+}

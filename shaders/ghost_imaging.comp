@@ -1,0 +1,276 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+#define MAX_SOURCES 64
+#define PI 3.14159265359
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct LightSource {
+    vec3 position;
+    vec3 direction;
+    WaveSpectrum spectrum;
+    float intensity;
+    float coherence_length;
+    int source_type;
+};
+
+struct GhostImagingParams {
+    ivec2 resolution;
+    uint num_sources;
+    float time;
+    int protocol_type;
+    float object_transmission;
+    float noise_level;
+    int correlation_order;
+    int measurement_basis;
+    float bucket_detector_size;
+    float spatial_resolution;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    GhostImagingParams params;
+};
+
+layout(set = 0, binding = 1, std140) readonly buffer SourceBuffer {
+    LightSource sources[MAX_SOURCES];
+};
+
+layout(set = 0, binding = 2, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+float gaussian_beam(vec2 r, float w) {
+    float r2 = dot(r, r);
+    return exp(-2.0 * r2 / (w * w));
+}
+
+float speckle_pattern(vec2 r, float correlation_length, int seed) {
+    float phase = 2.0 * PI * (r.x + r.y * 1.5 + float(seed) * 0.123);
+    float amp = sin(phase) * sin(phase * 1.3) * sin(phase * 1.7);
+    return amp * amp;
+}
+
+float thermal_correlation(vec2 r1, vec2 r2, float coherence_length) {
+    float dr = length(r1 - r2);
+    float coh = exp(-dr * dr / (2.0 * coherence_length * coherence_length));
+    return coh * coh;
+}
+
+float entangled_correlation(vec2 r1, vec2 r2, float coherence_length) {
+    float dr = length(r1 - r2);
+    float coh = exp(-dr * dr / (coherence_length * coherence_length));
+    return coh;
+}
+
+float ghost_image_signal(vec2 r_object, vec2 r_bucket, float correlation_length, float object_transmission) {
+    float correlation = thermal_correlation(r_object, r_bucket, correlation_length);
+    return correlation * object_transmission;
+}
+
+float compressive_ghost_imaging(vec2 r, float measurement_rate, float sparsity) {
+    float signal = speckle_pattern(r, 1.0, 42);
+    float recovered = signal * measurement_rate * (1.0 + sparsity);
+    return recovered;
+}
+
+float differential_ghost_imaging(vec2 r_ref, vec2 r_test, float correlation_length, float object_transmission) {
+    float C_ref = thermal_correlation(r_ref, r_ref, correlation_length);
+    float C_test = thermal_correlation(r_ref, r_test, correlation_length);
+    float C_cross = thermal_correlation(r_test, r_ref, correlation_length);
+    
+    return (C_cross - C_ref * object_transmission) / (C_ref + 1e-6);
+}
+
+float quantum_ghost_imaging(vec2 r_ref, vec2 r_test, float correlation_length, int n_photons) {
+    float correlation = entangled_correlation(r_ref, r_test, correlation_length);
+    float enhancement = sqrt(float(n_photons));
+    return correlation * enhancement;
+}
+
+float computational_ghost_imaging(vec2 r, vec2 patterns[16], int n_patterns, float bucket_values[16]) {
+    float sum = 0.0;
+    for (int i = 0; i < n_patterns && i < 16; i++) {
+        float pattern_val = speckle_pattern(r, 1.0, i);
+        sum += pattern_val * bucket_values[i];
+    }
+    return sum / float(n_patterns);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(params.resolution);
+    vec2 r = (uv - 0.5) * 2.0 * params.spatial_resolution;
+    
+    float intensity = 0.0;
+    vec3 color = vec3(0.0);
+    
+    float object_transmission = params.object_transmission;
+    float noise = params.noise_level;
+    float correlation_length = 10e-6;
+    
+    if (params.protocol_type == 0) {
+        vec2 r_bucket = vec2(0.0, 0.0);
+        float signal = ghost_image_signal(r, r_bucket, correlation_length, object_transmission);
+        intensity = signal;
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 1) {
+        float signal = compressive_ghost_imaging(r, 0.5, 0.1);
+        intensity = signal;
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 2) {
+        vec2 r_ref = -r;
+        float signal = differential_ghost_imaging(r, r_ref, correlation_length, object_transmission);
+        intensity = abs(signal);
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 3) {
+        vec2 r_ref = vec2(0.0);
+        float signal = quantum_ghost_imaging(r, r_ref, correlation_length, 10);
+        intensity = signal;
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 4) {
+        vec2 patterns[16];
+        float bucket[16];
+        for (int i = 0; i < 16; i++) {
+            patterns[i] = vec2(speckle_pattern(r, 1.0, i), 0.0);
+            bucket[i] = speckle_pattern(vec2(0.0), 1.0, i);
+        }
+        float signal = computational_ghost_imaging(r, patterns, 16, bucket);
+        intensity = signal;
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 5) {
+        vec2 r1 = r + vec2(1.0, 0.0) * 1e-6;
+        vec2 r2 = r - vec2(1.0, 0.0) * 1e-6;
+        float C1 = thermal_correlation(r1, r1, correlation_length);
+        float C2 = thermal_correlation(r2, r2, correlation_length);
+        float C12 = thermal_correlation(r1, r2, correlation_length);
+        
+        float g2 = (C12 - C1 * C2) / (C1 * C2 + 1e-6);
+        intensity = max(0.0, g2);
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 6) {
+        float signal = 0.0;
+        for (int i = 0; i < params.correlation_order; i++) {
+            vec2 r_i = r + vec2(cos(float(i) * 2.0 * PI / float(params.correlation_order)), 
+                                sin(float(i) * 2.0 * PI / float(params.correlation_order))) * 5e-6;
+            signal += thermal_correlation(r, r_i, correlation_length);
+        }
+        intensity = signal / float(params.correlation_order);
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 6) {
+        float signal = 0.0;
+        for (int i = 0; i < params.correlation_order; i++) {
+            vec2 r_i = r + vec2(cos(float(i) * 2.0 * PI / float(params.correlation_order)), 
+                                sin(float(i) * 2.0 * PI / float(params.correlation_order))) * 5e-6;
+            signal += thermal_correlation(r, r_i, correlation_length);
+        }
+        intensity = signal / float(params.correlation_order);
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 7) {
+        float bucket_radius = params.bucket_detector_size;
+        float signal = 0.0;
+        if (length(r) < bucket_radius) {
+            signal = 1.0;
+        } else {
+            signal = 0.0;
+        }
+        
+        float reference = speckle_pattern(r, correlation_length, 42);
+        float correlation = thermal_correlation(r, vec2(0.0), correlation_length);
+        
+        intensity = correlation * signal;
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 8) {
+        float signal = speckle_pattern(r, correlation_length, int(params.time * 1e12));
+        float reference = speckle_pattern(vec2(0.0), correlation_length, 42);
+        
+        float noise_val = noise * speckle_pattern(r, 1.0, 43);
+        
+        float correlation = (signal * reference) / (signal + reference + 1e-6);
+        intensity = correlation + noise_val;
+        color = vec3(intensity);
+    }
+    else if (params.protocol_type == 9) {
+        float signal = 0.0;
+        for (int i = 0; i < 10; i++) {
+            vec2 r_i = r + vec2(cos(float(i) * 0.628), sin(float(i) * 0.628)) * 2e-6 * i;
+            signal += thermal_correlation(r, r_i, correlation_length) * object_transmission;
+        }
+        intensity = signal / 10.0;
+        color = vec3(intensity);
+    }
+    
+    if (params.measurement_basis == 0) {
+    }
+    else if (params.measurement_basis == 1) {
+        color = vec3(intensity, intensity * 0.5, 0.0);
+    }
+    else if (params.measurement_basis == 2) {
+        color = vec3(intensity * 0.5, intensity, intensity * 0.5);
+    }
+    
+    float noise_val = noise * speckle_pattern(r, 1.0, int(params.time * 1e12));
+    intensity += noise_val;
+    color += vec3(noise_val);
+    
+    for (uint s = 0; s < params.num_sources; s++) {
+        LightSource src = sources[s];
+        for (uint w = 0; w < src.spectrum.count; w++) {
+            WaveComponent comp = src.spectrum.components[w];
+            color = wavelength_to_rgb(comp.wavelength_nm) * color;
+        }
+    }
+    
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    output_image[idx] = vec4(color, 1.0);
+}

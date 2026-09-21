@@ -1,0 +1,246 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+#define MAX_SOURCES 64
+#define PI 3.14159265359
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct LightSource {
+    vec3 position;
+    vec3 direction;
+    WaveSpectrum spectrum;
+    float intensity;
+    float coherence_length;
+    float axicon_angle;
+    float pulse_duration;
+    float spectral_width;
+    float cone_angle;
+};
+
+struct SpatiotemporalParams {
+    ivec3 volume_resolution;
+    uint num_sources;
+    float time;
+    float voxel_size;
+    float propagation_distance;
+    float temporal_window;
+    int packet_type;
+    float beta;
+    float alpha;
+};
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    SpatiotemporalParams params;
+};
+
+layout(set = 0, binding = 1, std140) readonly buffer SourceBuffer {
+    LightSource sources[MAX_SOURCES];
+};
+
+layout(set = 0, binding = 2, std140) writeonly buffer VolumeBuffer {
+    vec4 volume_data[];
+};
+
+float bessel_j0(float x) {
+    if (abs(x) < 1e-6) return 1.0;
+    float term = 1.0;
+    float sum = 1.0;
+    float x2 = x * x;
+    float denom = 1.0;
+    
+    for (int k = 1; k < 50; k++) {
+        denom *= -x2 / (4.0 * float(k*k));
+        term *= denom;
+        sum += term;
+        if (abs(term) < 1e-12) break;
+    }
+    return sum;
+}
+
+float bessel_j1(float x) {
+    if (abs(x) < 1e-6) return x / 2.0;
+    float term = x / 2.0;
+    float sum = term;
+    float x2 = x * x;
+    
+    for (int k = 1; k < 50; k++) {
+        term *= -x2 / (4.0 * float(k) * float(k+1));
+        sum += term;
+        if (abs(term) < 1e-12) break;
+    }
+    return sum;
+}
+
+vec3 x_wave(vec3 r, float z, float t, float beta, float alpha, float c) {
+    float R = sqrt(r.x * r.x + r.y * r.y);
+    float xi = z - c * t;
+    
+    if (params.packet_type == 0) {
+        float rho = sqrt(R*R + (xi/alpha)*(xi/alpha));
+        float amp = exp(-beta * rho) / rho;
+        return vec3(amp * cos(2.0 * PI * (z - c*t) / (1e-6)), 0.0, 0.0);
+    }
+    else if (params.packet_type == 1) {
+        float k = 2.0 * PI / (1e-6);
+        float arg = sqrt(R*R + alpha*alpha) * sin(params.beta);
+        float bessel = bessel_j0(arg);
+        float amp = exp(-R*R / (100e-6*100e-6)) * bessel;
+        float phase = k * (z - c*t) * cos(params.beta);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 2) {
+        float R2 = r.x*r.x + r.y*r.y + r.z*r.z;
+        float arg = sqrt(R2);
+        float amp = exp(-beta * arg) / arg;
+        float phase = 2.0 * PI * (arg - c*t) / (1e-6);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 3) {
+        float rho = sqrt(R*R + alpha*alpha * (xi*xi));
+        float amp = exp(-beta * rho) * exp(-alpha*alpha * xi*xi);
+        float phase = 2.0 * PI * (z - c*t) / (1e-6);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 4) {
+        float R2 = r.x*r.x + r.y*r.y + r.z*r.z;
+        float amp = 0.0;
+        if (R2 > 0.0) {
+            float k = 2.0 * PI / (1e-6);
+            amp = sin(k * R2) / R2;
+        }
+        float phase = 2.0 * PI * (sqrt(R2) - c*t) / (1e-6);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 5) {
+        float rho = sqrt(R*R + alpha*alpha * (z - c*t)*(z - c*t));
+        float amp = exp(-beta * rho) / (1.0 + alpha*alpha * (z - c*t)*(z - c*t));
+        float phase = 2.0 * PI * (z - c*t) / (1e-6);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 6) {
+        float R2 = r.x*r.x + r.y*r.y;
+        float k_perp = 2.0 * PI * params.beta / (1e-6);
+        float k_z = 2.0 * PI * sqrt(1.0 - params.beta*params.beta) / (1e-6);
+        float arg = k_perp * sqrt(R2);
+        float bessel = bessel_j0(arg);
+        float amp = exp(-R2 / (100e-6*100e-6)) * bessel;
+        float phase = k_z * z - 2.0 * PI * 3e8 * t / (1e-6);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 7) {
+        float R2 = r.x*r.x + r.y*r.y;
+        float k_perp = 2.0 * PI * params.beta / (1e-6);
+        float k_z = 2.0 * PI * sqrt(1.0 - params.beta*params.beta) / (1e-6);
+        float arg = k_perp * sqrt(R2);
+        float J1 = (sin(arg) / (arg*arg) - cos(arg) / arg);
+        float amp = 2.0 * J1 / arg;
+        float phase = k_z * z - 2.0 * PI * 3e8 * t / (1e-6);
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 8) {
+        float k0 = 2.0 * PI / (1e-6);
+        float omega0 = 2.0 * PI * 3e8 / (1e-6);
+        float rho = sqrt(r.x*r.x + r.y*r.y);
+        float R3 = sqrt(rho*rho + r.z*r.z);
+        float sigma = 10e-6;
+        
+        float amp = 0.0;
+        if (R3 > 0.0) {
+            amp = exp(-R3*R3 / (2.0*sigma*sigma)) / R3;
+        }
+        float phase = k0 * r.z - omega0 * t;
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    else if (params.packet_type == 9) {
+        float k0 = 2.0 * PI / (1e-6);
+        float omega0 = 2.0 * PI * 3e8 / (1e-6);
+        float rho = sqrt(r.x*r.x + r.y*r.y);
+        float R3 = sqrt(rho*rho + r.z*r.z);
+        float sigma_r = 10e-6;
+        float sigma_z = 5e-6;
+        float sigma_t = 10e-15;
+        
+        float amp = exp(-rho*rho/(2.0*sigma_r*sigma_r) - r.z*r.z/(2.0*sigma_z*sigma_z)) 
+                  * exp(-t*t/(2.0*sigma_t*sigma_t));
+        
+        float phase = k0 * r.z - omega0 * t;
+        return vec3(amp * cos(phase), amp * sin(phase), 0.0);
+    }
+    
+    return vec3(0.0);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
+
+void main() {
+    ivec3 voxel = ivec3(gl_GlobalInvocationID.xyz);
+    if (voxel.x >= params.volume_resolution.x || 
+        voxel.y >= params.volume_resolution.y || 
+        voxel.z >= params.volume_resolution.z) return;
+    
+    vec3 world_pos = vec3(voxel) * params.voxel_size;
+    float t = params.time;
+    
+    uint vol_idx = (voxel.z * params.volume_resolution.y + voxel.y) * params.volume_resolution.x + voxel.x;
+    
+    vec3 accumulated_field = vec3(0.0);
+    
+    for (uint s = 0; s < params.num_sources; s++) {
+        LightSource src = sources[s];
+        
+        vec3 field = x_wave(world_pos - src.position, 
+                           dot(world_pos - src.position, src.direction),
+                           t - dot(world_pos - src.position, src.direction) / 3e8,
+                           src.axicon_angle, src.pulse_duration, 3e8);
+        
+        accumulated_field += field * src.intensity;
+    }
+    
+    float intensity = dot(accumulated_field, accumulated_field);
+    vec3 color = wavelength_to_rgb(800.0) * accumulated_field;
+    
+    if (params.packet_type <= 1) {
+        color = vec3(intensity, intensity * 0.5, intensity);
+    } else {
+        color = vec3(intensity);
+    }
+    
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    volume_data[vol_idx] = vec4(color, intensity);
+}

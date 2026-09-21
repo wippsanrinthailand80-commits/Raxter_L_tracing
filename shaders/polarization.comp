@@ -1,0 +1,187 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MAX_WAVELENGTHS 32
+
+struct WaveComponent {
+    float wavelength_nm;
+    float amplitude;
+    float phase;
+    vec3 polarization;
+};
+
+struct WaveSpectrum {
+    WaveComponent components[MAX_WAVELENGTHS];
+    uint count;
+};
+
+struct PolarizationParams {
+    ivec2 resolution;
+    float wavelength_nm;
+    float polarizer_angle;
+    float analyzer_angle;
+    float retarder_phase;
+    int retarder_type;
+    int test_mode;
+};
+
+vec3 wavelength_to_rgb(float lambda);
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    PolarizationParams params;
+};
+
+layout(set = 0, binding = 1, std140) writeonly buffer OutputBuffer {
+    vec4 output_image[];
+};
+
+mat3 rotation_matrix(float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return mat3(c, -s, 0.0,
+                s, c, 0.0,
+                0.0, 0.0, 1.0);
+}
+
+mat3 waveplate_matrix(float phase, float fast_axis_angle) {
+    mat3 R = rotation_matrix(fast_axis_angle);
+    mat3 W = mat3(1.0, 0.0, 0.0,
+                  0.0, cos(phase), -sin(phase),
+                  0.0, sin(phase), cos(phase));
+    return transpose(R) * W * R;
+}
+
+mat3 polarizer_matrix(float angle) {
+    mat3 R = rotation_matrix(angle);
+    mat3 P = mat3(1.0, 0.0, 0.0,
+                  0.0, 0.0, 0.0,
+                  0.0, 0.0, 0.0);
+    return transpose(R) * P * R;
+}
+
+mat3 analyzer_matrix(float angle) {
+    return polarizer_matrix(angle);
+}
+
+vec3 stokes_vector(vec3 E) {
+    float I = dot(E, E);
+    float Q = E.x * E.x - E.y * E.y;
+    float U = 2.0 * E.x * E.y;
+    float V = 0.0;
+    return vec4(I, Q, U, V).xyz;
+}
+
+mat3 mueller_polarizer(float angle) {
+    float c2 = cos(2.0 * angle);
+    float s2 = sin(2.0 * angle);
+    mat3 m = mat3(1.0, c2, s2,
+                  c2, c2*c2, c2*s2,
+                  s2, c2*s2, s2*s2);
+    return 0.5 * m;
+}
+
+mat3 mueller_retarder(float phase, float fast_axis) {
+    float c2 = cos(2.0 * fast_axis);
+    float s2 = sin(2.0 * fast_axis);
+    float c = cos(phase);
+    float s = sin(phase);
+    
+    return mat3(1.0, 0.0, 0.0,
+                0.0, c2*c2 + c*s2*s2, c2*s2*(1.0 - c),
+                0.0, c2*s2*(1.0 - c), s2*s2 + c*c2*c2);
+}
+
+float malus_law(float theta) {
+    return cos(theta) * cos(theta);
+}
+
+float birefringence_phase(float thickness, float delta_n, float wavelength) {
+    return 2.0 * 3.14159265359 * delta_n * thickness / (wavelength * 1e-9);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= params.resolution.x || pixel.y >= params.resolution.y) return;
+    
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(params.resolution);
+    uv = uv * 2.0 - 1.0;
+    
+    float wavelength = params.wavelength_nm;
+    float intensity = 1.0;
+    vec3 color = vec3(0.0);
+    
+    if (params.test_mode == 0) {
+        float angle_diff = params.analyzer_angle - params.polarizer_angle;
+        intensity = malus_law(angle_diff);
+        color = vec3(intensity);
+    }
+    else if (params.test_mode == 1) {
+        float phase = birefringence_phase(1e-3, 0.009, wavelength);
+        float pol_angle = params.polarizer_angle;
+        float ana_angle = params.analyzer_angle;
+        float retarder_angle = 3.14159265359 / 4.0;
+        
+        float I0 = 1.0;
+        float I = I0 * 0.5 * (1.0 + cos(2.0 * (pol_angle - retarder_angle)) * cos(2.0 * (ana_angle - retarder_angle)) * cos(phase)
+                           + sin(2.0 * (pol_angle - retarder_angle)) * sin(2.0 * (ana_angle - retarder_angle)));
+        intensity = I;
+        color = vec3(intensity);
+    }
+    else if (params.test_mode == 2) {
+        float angle = atan(uv.y, uv.x);
+        float radial_pol = angle;
+        float analyzer = params.analyzer_angle;
+        intensity = malus_law(radial_pol - analyzer);
+        color = vec3(intensity);
+    }
+    else if (params.test_mode == 3) {
+        vec3 E_in = vec3(cos(params.polarizer_angle), sin(params.polarizer_angle), 0.0);
+        
+        mat3 pol = polarizer_matrix(params.polarizer_angle);
+        mat3 ret = waveplate_matrix(params.retarder_phase, 3.14159265359 / 4.0);
+        mat3 ana = analyzer_matrix(params.analyzer_angle);
+        
+        vec3 E_out = ana * ret * pol * E_in;
+        intensity = dot(E_out, E_out);
+        color = vec3(intensity);
+    }
+    else if (params.test_mode == 4) {
+        float phase = params.retarder_phase + uv.x * 3.14159265359 * 2.0;
+        mat3 ret = waveplate_matrix(phase, 0.0);
+        vec3 E_in = vec3(1.0, 0.0, 0.0);
+        vec3 E_out = ret * E_in;
+        intensity = dot(E_out, E_out);
+        color = vec3(E_out.x, E_out.y, 0.0);
+    }
+    
+    color = wavelength_to_rgb(wavelength) * color;
+    color = pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2));
+    
+    uint idx = pixel.y * params.resolution.x + pixel.x;
+    output_image[idx] = vec4(color, 1.0);
+}
+
+vec3 wavelength_to_rgb(float lambda) {
+    vec3 rgb = vec3(0.0);
+    if (lambda >= 380.0 && lambda < 440.0) {
+        rgb = vec3(-(lambda - 440.0) / 60.0, 0.0, 1.0);
+    } else if (lambda >= 440.0 && lambda < 490.0) {
+        rgb = vec3(0.0, (lambda - 440.0) / 50.0, 1.0);
+    } else if (lambda >= 490.0 && lambda < 510.0) {
+        rgb = vec3(0.0, 1.0, -(lambda - 510.0) / 20.0);
+    } else if (lambda >= 510.0 && lambda < 580.0) {
+        rgb = vec3((lambda - 510.0) / 70.0, 1.0, 0.0);
+    } else if (lambda >= 580.0 && lambda < 645.0) {
+        rgb = vec3(1.0, -(lambda - 645.0) / 65.0, 0.0);
+    } else if (lambda >= 645.0 && lambda <= 780.0) {
+        rgb = vec3(1.0, 0.0, 0.0);
+    }
+    
+    float factor = 1.0;
+    if (lambda < 420.0) factor = 0.3 + 0.7 * (lambda - 380.0) / 40.0;
+    else if (lambda > 700.0) factor = 0.3 + 0.7 * (780.0 - lambda) / 80.0;
+    
+    return rgb * factor;
+}
